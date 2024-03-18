@@ -1,0 +1,792 @@
+---
+title: "STA 141A Final Project:
+Predicting Success Rates in Mice during a Visual Decision"
+author: "Zihao Sun"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: cerulean
+    highlight: tango
+    toc: true
+    toc_float: true
+    css: styles.css
+---
+# Abstract
+  Understanding neural activity in response to stimuli is crucial for comprehending complex decision-making processes in animals. This study investigates the spike rate of mice while performing a visual discrimination task that presents two stimuli with contrast differences. Success in the task is determined by the mice's choice of the stimulus with higher contrast. Through meticulous data analysis and visualizations, a positive correlation between greater contrast differences and success rates was observed. Subsequently, a predictive model was developed using XGBoost, incorporating variables such as contrast differences and spike rate over time to accurately forecast task performance.
+
+# Introduction
+  The brain processes visual information through specialized circuits, enabling organisms to extract relevant cues and make adaptive decisions. In this study, I aim to explore the spike rate patterns of mice engaged in a task involving visual stimuli with varying contrasts. The task requires mice to select the stimulus with higher contrast to achieve success. Through rigorous experimentation, data were collected across 18 sessions involving a total of four mice: Cori, Forssman, Hench, and Lederberg.  
+  My analysis delves into several key variables that may influence task performance and decision-making processes. These variables include time, spike number, neuron number, brain area, contrast difference, and feedback type for each trial. With the goal of constructing a predictive model capable of forecasting task outcomes accurately, I made a few assumptions based on these variables. Firstly, I hypothesize that differences may exist in the number of neurons within specific brain areas for each mouse. Mice with higher mean spike rates in certain brain areas may have a higher success rate since their neural activity is higher than that of the other subjects. Secondly, variations in the brain areas involved in the decision-making process may exist. The presence of these unique areas could be associated with higher success rates. Lastly, I assume that higher contrast levels may lead to increased success rates in completing the task.
+  Through systematic investigation, I aim to examine the relationship between variables and success rates based on these hypotheses and evaluate which factors contribute significantly to developing a robust predictive model. By elucidating the intricate relationships in the visual discrimination task, this study could contribute to a deeper understanding of the underlying neural mechanisms governing the decision-making processes in animals.
+
+# Exploratory analysis
+## Data Strucutre
+  Before starting the analysis, I need to import the data and observe the basic data format. After reading the Final project guide, I only know that this data set has sessions1-18 and corresponding variables.
+```{r}
+# load necessary packages
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(tidyverse)
+library(caret)
+library(lubridate)
+library(xgboost)
+library(forecast)
+library(pROC)
+library(lubridate)
+library(broom)
+library(tseries)
+library(purrr)
+library(GGally)
+# create a list to store and load the data
+session <- list()
+# load session1.rds to session18.rds
+for (i in 1:18) {
+  file_path <- paste0("./sessions/session", i, ".rds")
+  session[[i]] <- readRDS(file_path)
+}
+
+# check mouse name and created adte
+for (i in 1:18) {
+  cat("Session", i, ":\n")
+  cat("Mouse name:", session[[i]]$mouse_name, "\n")
+  cat("Date:", session[[i]]$date_exp, "\n\n")
+}
+# check the variables in session1 (every session same)
+names(session[[1]])
+
+# check the data strcutre 734*40 matrix (734 is the neneuron and 40 is timebin  )
+dim(session[[1]]$spks[[1]])
+
+# each neuron has a brain area
+length(session[[1]]$brain_area)
+
+# 6th neuron in ?th time bin（total is 40) have 1 spike
+session[[1]]$spks[[1]][6,]
+# 6th neuron in 3th time bin have 1 spike
+session[[1]]$spks[[1]][6,3] 
+
+# where 6th neuron brain area it is , which means the 6th neuron in 1th trial in session1 in the ACA brain area with 1 spike in 3th time bin.
+session[[1]]$brain_area[6]
+
+# check how many brain area in session1 invovled  
+unique(session[[1]]$brain_area)
+```
+## Functions for calculating
+I know the basic format of the data, such as which sessions each mouse appears in, and the corresponding data structures of brain area and spks. In this final project, my main purpose is to build a model and predict feedback type, which is the accuracy rate. So, for the purpose of this prediction, I'm now going to start looking for relationships between different variables and the success rate of the mice.
+```{r}
+# check designed trial in session
+get_trial_data <- function(session_id, trial_id){
+  # get the spike info
+  spikes <- session[[session_id]]$spks[[trial_id]]
+  # check NA value and omit it
+  if (any(is.na(spikes))){
+    warning("value missing in session ", session_id, " trial ", trial_id)
+    spikes[is.na(spikes)] <- 0
+  }
+  #get how many spikes in the neuron
+  trial_tibble <- tibble("neuron_spike" = rowSums(spikes))  %>%  
+    add_column("brain_area" = session[[session_id]]$brain_area ) %>% 
+    # classify them by brain area
+    group_by(brain_area) %>% 
+    # sum spikes in region
+    summarize( region_sum_spike = sum(neuron_spike),
+               # sum neuron in region
+               region_count = n(),
+               # average spike in region
+               region_mean_spike = mean(neuron_spike)
+               ) %>%
+    # more variabls info
+    add_column(trial_id = trial_id) %>%
+    add_column(contrast_left = session[[session_id]]$contrast_left[trial_id]) %>% 
+    add_column(contrast_right = session[[session_id]]$contrast_right[trial_id]) %>% 
+    add_column(feedback_type = session[[session_id]]$feedback_type[trial_id])
+  
+  return(trial_tibble)
+}
+# all trial info in one session
+get_session_data <- function(session_id){
+  session_data <- session[[session_id]]
+  trial_num <- length(session_data$spks)
+  
+  # combine all info
+  session_tibble <- map_dfr(1:trial_num, ~ get_trial_data(session_id, .x))
+  
+  # additional info for session info
+  session_tibble$session_id <- session_id
+  session_tibble$mouse_name <- session_data$mouse_name
+  session_tibble$date_exp <- session_data$date_exp
+  
+  return(session_tibble)
+}
+# Another method/ average spike over the time bin(total time bin in one spike is 40)
+get_trial_data_bytime <- function(session_id, trial_id){
+  spikes <- session[[session_id]]$spks[[trial_id]]
+  
+  if (any(is.na(spikes))){
+    warning("value missing in session ", session_id, " trial ", trial_id)
+    spikes[is.na(spikes)] <- 0
+  }
+  trail_bin_average <- matrix(colMeans(spikes), nrow = 1)
+  colnames(trail_bin_average) <- paste0("bin", 1:40)
+  
+  trail_tibble <- as_tibble(trail_bin_average) %>%
+    mutate(
+      trial_id = trial_id,
+      contrast_left = session[[session_id]]$contrast_left[trial_id],
+      contrast_right = session[[session_id]]$contrast_right[trial_id],
+      feedback_type = session[[session_id]]$feedback_type[trial_id],
+      session_id = session_id
+    )
+  return(trail_tibble)
+}
+```
+
+```{r}
+# test code area
+# trial data with session1 trial2
+trial_tibble_1_2 <- get_trial_data(1,2)
+trial_tibble_1_2
+# session1 data
+session3 <- get_session_data(2)
+# check 1-6 trial bin in session1 
+trial_bin_average_1_1_to_6 <- map_dfr(1:6, ~ get_trial_data_bytime(1, .x))
+print(trial_bin_average_1_1_to_6)
+```
+## Set first assumption
+After observing the data frame, I made a hypothesis - I observed that there is a brain area in each session data, and there are statistics on the number of neurons in the brain area, and neurons will occur with spikes, so there are spike times. After further observation, I found that the recorded names of the brain areas of the four mice were different, and the number of counts in a specific brain area was different in each session. Therefore, I plan to sort out the brain areas, neurons, and corresponding spike rates to further analyze their relationship with the success rate.
+```{r}
+# get the number of neuron for each session
+get_neuron_count_by_session <- function(session_id){
+  # get the neuron count for index 1
+  neuron_count <- nrow(session[[session_id]]$spks[[1]])
+  return(neuron_count)
+}
+
+# test function
+for (i in 1:18) {
+  neuron_count <- get_neuron_count_by_session(i)
+  cat("Session", i, "has", neuron_count, "neurons\n")
+}
+  
+  #get number of brain area in each session
+get_brain_area_count_by_session <- function(session_id) {
+  # designed the session and No. brain area
+  brain_areas <- session[[session_id]]$brain_area
+  
+  # all unique brain areas in one session
+  unique_brain_areas <- unique(brain_areas)
+  brain_area_count <- length(unique_brain_areas)
+  
+  return(brain_area_count)
+}
+
+# test code area
+for (i in 1:18) {
+  brain_area_count <- get_brain_area_count_by_session(i)
+  cat("Session", i, "has", brain_area_count, "unique brain areas\n")
+}
+
+# brain area in each session
+get_brain_areas_per_session <- function(session_id) {
+  brain_areas <- unique(session[[session_id]]$brain_area)
+  return(brain_areas)
+}
+
+# session and mice success rate
+estimate_success_rate <- function(session_id) {
+  feedback_types <- unlist(lapply(session[[session_id]]$feedback_type, function(trial) trial))
+  success_count <- sum(feedback_types > 0)
+  total_trials <- length(feedback_types)
+  success_rate <- success_count / total_trials
+  return(success_rate)
+}
+```
+## Connect datas with session and success rate
+```{r}
+# average spike over the mouse
+calculate_spike_rate_per_mouse <- function(mouse_sessions) {
+  session_mean_spike_rates <- sapply(mouse_sessions, function(session) {
+    trial_mean_spike_rates <- sapply(session$spks, function(trial_spks) {
+      mean(trial_spks)
+    })
+    mean(trial_mean_spike_rates)
+  })
+  mean(session_mean_spike_rates)
+}
+
+# try to coneect the mouse with the session
+mouse_sessions <- list(
+  "Cori" = session[1:3],
+  "Forssmann" = session[4:7],
+  "Hench" = session[8:11],
+  "Lederberg" = session[12:18]
+)
+
+# average spike rate for mouse
+spike_rates_per_mouse <- map_dbl(mouse_sessions, calculate_spike_rate_per_mouse)
+spike_rates_per_mouse <- enframe(spike_rates_per_mouse, name = "mouse_name", value = "spike_rate")
+
+# check the result(average spike rate over timebin for each mouse)
+print(spike_rates_per_mouse)
+
+# output the per mouse success rate
+success_rates_per_mouse <- map_df(names(mouse_sessions), function(mouse_name) {
+  mouse_session_ids <- which(sapply(session, function(x) x$mouse_name) %in% mouse_name)
+  success_rates <- map_dbl(mouse_session_ids, estimate_success_rate)
+  data_frame(mouse_name = mouse_name, success_rate = mean(success_rates))
+})
+
+# print out
+print(success_rates_per_mouse)
+
+
+```
+## The correlation between the success rate and active brain regions
+```{r}
+# get all sessions info
+all_session_data <- map_dfr(1:length(session), ~get_session_data(.x))
+# get the spike rate over the timebin in the trial
+all_trial_time_data <- map_dfr(1:length(session), function(s_id) {
+  map_dfr(1:length(session[[s_id]]$spks), ~get_trial_data_bytime(s_id, .x))
+})
+# combine two df
+full_data11 <- left_join(all_session_data, all_trial_time_data, by = c("session_id", "trial_id"))
+
+full_data11$contrast_diff <- abs(full_data11$contrast_right.x - full_data11$contrast_left.x)
+
+# PCA test(use feature)
+numeric_features <- full_data11 %>%
+  select(matches("^bin"))
+
+
+numeric_features_scaled <- scale(numeric_features)
+# excute the PCA
+pca_result <- prcomp(numeric_features_scaled, center = TRUE, scale. = TRUE)
+
+# check the PCA result
+summary(pca_result)
+
+library(ggplot2)
+
+# get the pca scores let me to check
+pca_scores <- as.data.frame(pca_result$x)
+
+# put the session id and mouse name in it
+pca_scores$session_id <- full_data11$session_id
+pca_scores$mouse_name <- full_data11$mouse_name
+
+# plot the scatterplot how PC1 and PC2 interact with sessions
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = as.factor(session_id))) +
+  geom_point() +
+  theme_minimal() +
+  labs(title = "PCA: First two principal components by Session",
+       x = "PC1 (69.08% variance)",
+       y = "PC2 (5.78% variance)")
+
+# with mouses 
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = mouse_name)) +
+  geom_point() +
+  theme_minimal() +
+  labs(title = "PCA: First two principal components by Mouse",
+       x = "PC1 (69.08% variance)",
+       y = "PC2 (5.78% variance)")
+
+
+set.seed(141)
+# set the kmess k=4
+k <- kmeans(pca_scores[, c("PC1", "PC2")], centers = 4)
+pca_scores$cluster <- as.factor(k$cluster)
+
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = cluster)) +
+  geom_point(alpha = 0.6) +
+  theme_minimal() +
+  labs(title = "K-means Clustering on PCA Results")
+
+# check all brain area info
+neuron_totals <- full_data11 %>%
+  group_by(mouse_name, brain_area) %>%
+  summarize(total_neurons = sum(region_count), .groups = 'drop')
+
+# get the average spike rate for brain area
+average_spike_rates <- full_data11 %>%
+  group_by(mouse_name, brain_area) %>%
+  summarize(avg_spike_rate = mean(region_mean_spike), .groups = 'drop')
+
+
+# coembie data
+combined_data3 <- left_join(neuron_totals, average_spike_rates, by = c("mouse_name", "brain_area"))
+
+# continue to add success rate info
+combined_data3 <- left_join(combined_data3, success_rates_per_mouse, by = "mouse_name")
+
+# find the common brain areas that mouse they have
+common_brain_areas <- full_data11 %>%
+  group_by(brain_area) %>%
+  filter(n_distinct(mouse_name) == 4) %>%
+  summarize(total_neurons = sum(region_count),
+            avg_spike_rate = mean(region_mean_spike),
+            .groups = 'drop')
+# find the unique brain areas that mouse they have
+unique_brain_areas <- full_data11 %>%
+  group_by(mouse_name, brain_area) %>%
+  filter(!brain_area %in% common_brain_areas$brain_area) %>%
+  summarize(total_neurons = sum(region_count),
+            avg_spike_rate = mean(region_mean_spike),
+            .groups = 'drop')
+
+
+# and then check the spike rate in the common area and total number of neuron
+common_brain_areas_per_mouse <- full_data11 %>%
+  filter(brain_area %in% common_brain_areas$brain_area) %>%
+  group_by(mouse_name, brain_area) %>%
+  summarize(total_neurons = sum(region_count),
+            avg_spike_rate = mean(region_mean_spike),
+            .groups = 'drop')
+
+#  then check the spike rate in the unique area and total number of neuron
+unique_brain_areas_per_mouse <- full_data11 %>%
+  filter(!(brain_area %in% common_brain_areas$brain_area)) %>%
+  group_by(mouse_name, brain_area) %>%
+  summarize(total_neurons = sum(region_count),
+            avg_spike_rate = mean(region_mean_spike),
+            .groups = 'drop')
+
+# create the plot that shows the how common brain area's correlation with neurons and spike rate by mouses
+ggplot(common_brain_areas_per_mouse, aes(x = total_neurons, y = avg_spike_rate)) +
+  geom_point(aes(color = brain_area)) +
+  facet_wrap(~mouse_name) +
+  theme_minimal() +
+  labs(title = "common brain areas per mouse",
+       x = "total neurons",
+       y = "average spike rate")
+
+# create the plot that shows the how unique brain areas correlation with neurons and spike rate by mouses
+ggplot(unique_brain_areas_per_mouse, aes(x = total_neurons, y = avg_spike_rate)) +
+  geom_point(aes(color = brain_area)) +
+  facet_wrap(~mouse_name) +
+  theme_minimal() +
+  labs(title = "unique brain areas per mouse",
+       x = "neurons",
+       y = "average spike rate")
+
+# combien data
+common_brain_areas_per_mouse_with_success_rate <- left_join(common_brain_areas_per_mouse, success_rates_per_mouse, by = "mouse_name")
+common_brain_areas_per_mouse_with_success_rate
+# fit the linear regression model and check summary
+model <- lm(success_rate ~ total_neurons + avg_spike_rate + brain_area, data = common_brain_areas_per_mouse_with_success_rate)
+summary(model)
+```
+  
+## First Hypothesis Testing & Results
+How brain area We performed a PCA score test on the overall data frame (including trial id, contrast diff, brain area, count, region spike rate....). The conclusion tells us that there are two PC A with higher scores, and PC1 is accompanied by 69.08% variance explains a large amount of variation, and PC2's 5.78% variance explains a small amount of variation. Although only two PCAs are significant, the variance of the other PCs decreases rapidly and implies a decrease in explanatory power. It can be observed from the drawing that the high PC score mainly explains the last few sessions, which is the session where the Lederberg mouse is located, and his success rate is the highest among the four mice, with 76.39%, which means that the success rate can be explained and predicted by two variables. However, the results of the cluster analysis indicate that there is no clear and separate group, which implies that there may be overlap in the data, which means that our hypotheses and speculations may be invalid. Because when the data overlap is high, you cannot use one set of data to predict another set. It happens that our data is filled with a large amount of brain area data, and we found that although there are different success rates between mice, as well as different The number of neurons recorded in specific brain regions also varied between sessions. But when I analyzed and counted all the brain area types and neuron numbers of the four mice, I found that only 7 brain areas were shared among the four mice, which was far smaller than the number of unique brain areas they had. This means that it is very difficult to use 7 data to explain dozens of data. Therefore, after counting the same brain areas and different brain areas among mice, I performed regression analysis to fit the model. The results are as expected. The pvalues ​​of total_neurons, avg_spike_rate, brain_areaCA3, brain_areaDG, brain_areaMOs, brain_arearoot, brain_areaSUB, and brain_areaVISp are all very large, much higher than 0.05, which means that we have no way to prove that they are related to the success rate. This also means that in the subsequent analysis, I need to focus on other variables instead of continuing to look for the impact of spike rate on the success rate of active brain areas and their related neurons. Because all analytical results point to a very weak correlation. Therefore, I need to analyze other variables to find the best prediction model before making a prediction model. 
+
+## Second assumption
+Now I have a new hypothesis: I'm thinking about the link between contrast diff and success rate, and the adaptability of the mice to changes in trial success rate over time.
+```{r}
+# get the feedback type from all sessions
+all_data <- bind_rows(lapply(session, function(s) {
+  # temp data frame for calculate the contrast diff
+  temp_df <- data.frame(contrast_left = s$contrast_left, contrast_right = s$contrast_right, feedback_type = s$feedback_type)
+  temp_df <- temp_df %>%
+    mutate(contrast_diff = abs(contrast_left - contrast_right),
+           success = ifelse(feedback_type == 1, 1, 0))
+  return(temp_df)
+}))
+
+# find the overall success rate for different contrast diff
+success_rate_by_contrast_diff <- all_data %>%
+  group_by(contrast_diff) %>%
+  summarise(success_rate = mean(success)) %>%
+  ungroup() %>%
+  arrange(contrast_diff)
+
+# check result
+print(success_rate_by_contrast_diff)
+
+# get mousenmae,contrast left...(all info) from each session
+process_session <- function(s) {
+  data.frame(
+    mouse_name = s$mouse_name,
+    contrast_left = s$contrast_left,
+    contrast_right = s$contrast_right,
+    feedback_type = s$feedback_type
+  ) %>%
+    mutate(
+      contrast_diff = abs(contrast_left - contrast_right),
+      success = feedback_type == 1
+    )
+}
+# combine the info from each sessions
+all_sessions_data <- lapply(session, process_session) %>% 
+  bind_rows()
+
+# get the success rate by mouse and coutrast diff
+success_rates_by_mouse_and_diff <- all_sessions_data %>%
+  group_by(mouse_name, contrast_diff) %>%
+  summarise(
+    success_count = sum(success),
+    total_trials = n(),
+    success_rate = success_count / total_trials,
+    .groups = 'drop'
+  ) %>%
+  pivot_wider(
+    names_from = contrast_diff,
+    values_from = success_rate
+  )
+
+# check the reuslt
+print(success_rates_by_mouse_and_diff)
+
+```
+## Findings about second assumption
+I calculated their success rates for different mice and different contrasts. Obviously, at higher contrasts, the overall success rate is improving. From the perspective of each mouse, the success rate is also improving. And the highest value is higher than the previously calculated 76.39%. Then follow this clue to perform visual analysis and inspection analysis to determine the relationship between success rate and contrast, as well as the role spike rate plays in between, because this is data that changes every moment with time.
+```{r}
+#small mice
+# re-calcaute the success rate by each mouse because previous dataframe has something wrong
+mouse_names <- unique(sapply(session, `[[`, "mouse_name"))
+mouse_success_rates <- sapply(mouse_names, function(mouse) {
+  sessions_mouse <- session[sapply(session, function(s) s$mouse_name == mouse)]
+  mean_success_rate <- mean(unlist(lapply(sessions_mouse, function(s) {
+    mean(s$feedback_type == 1)
+  })))
+  return(mean_success_rate)
+})
+
+# create new df for success rate for each mouse
+success_rate_df <- data.frame(
+  mouse_name = mouse_names,
+  mouse_success_rate = mouse_success_rates
+)
+
+# check it 
+print(success_rate_df)
+
+# order it by success rate
+success_rate_df <- success_rate_df[order(success_rate_df$mouse_success_rate, decreasing = TRUE),]
+
+# choose top 2 sucess rate mouse be high and other be low
+high_success_mice <- success_rate_df$mouse_name[1:2]
+low_success_mice <- success_rate_df$mouse_name[(nrow(success_rate_df)-1):nrow(success_rate_df)]
+
+# df that contain high low group and mosue name
+mouse_groups <- data.frame(
+  mouse_name = success_rate_df$mouse_name,
+  group = ifelse(success_rate_df$mouse_name %in% high_success_mice, "High", "Low")
+)
+
+print(mouse_groups)
+
+# combine data frame
+spike_rates_per_mouse_with_group <- merge(spike_rates_per_mouse, mouse_groups, by = "mouse_name")
+
+# create the boxplot to see the corrleation
+ggplot(spike_rates_per_mouse_with_group, aes(x = group, y = spike_rate, fill = group)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "soike rate by group", x = "group", y = "spike Rate")
+
+# use t test to check two groups spike rate
+t.test(spike_rate ~ group, data = spike_rates_per_mouse_with_group)
+
+
+# combine dataframe
+success_rates_by_mouse_and_diff_with_group <- merge(success_rates_by_mouse_and_diff, mouse_groups, by = "mouse_name")
+
+# reshape data and more suitable for visulavize
+success_rates_by_mouse_and_diff_reshaped <- success_rates_by_mouse_and_diff_with_group %>%
+  pivot_longer(cols = c("0", "0.25", "0.5", "0.75", "1"), names_to = "contrast_diff", values_to = "success_rate")
+
+# show how two groups have the performance in different contrast diff
+ggplot(success_rates_by_mouse_and_diff_reshaped, aes(x = contrast_diff, y = success_rate, color = group)) +
+  geom_point() +
+  geom_line(aes(group = mouse_name)) +
+  theme_minimal() +
+  labs(title = "success rate by contast diff and mouse group", x = "contrast diff", y = "success rate")
+```
+## Relationship between assumptions and adaptation 
+After classifying the four mice into high and low success rates, we had two sets of data, and then conducted t-test and visual analysis on them. The results showed that the overall spike rate did not affect the success rate because there was no significant difference. The differences. In addition, the box plot shows a high degree of overlap between the high and low groups, and their medians are similar, proving the results of the t test. However, when we plotted success rate and contrast diff for high and low success rates, I found a clear trend - higher contrast is associated with higher success rates, which confirms the previous Assumption. However, we need more analysis on the relationship between average spike rate and success rate, because adaptability is a basic theory accompanied by Darwin's theory of evolution, that is, as time changes, the mice undergoing the experiment will gradually become more adapted to the experiment, and This also contributes to the predictability of experimental results.
+
+```{r}
+# get the avergae spike rate for each mouse in each session
+spike_rate_by_mouse_and_session <- map_df(1:length(session), function(i) {
+  session_data <- get_session_data(i)
+  data.frame(mouse_name = session_data$mouse_name[1], session_id = i, mean_spike_rate = mean(session_data$region_mean_spike))
+})
+
+# firgue out how the avergae spike rate change over time
+ggplot(spike_rate_by_mouse_and_session, aes(x = session_id, y = mean_spike_rate, color = mouse_name)) +
+  geom_point() +
+  geom_line() +
+  theme_minimal() +
+  labs(title = "spike rate for overall sessions by each mouse name", x = "session", y = "average spike rate")
+
+
+# extract exp date from sessions
+exp_dates <- lapply(mouse_sessions, function(sessions) {
+  sapply(sessions, function(session) unique(session$date_exp))
+})
+
+# convert the format
+exp_dates <- lapply(exp_dates, as.Date)
+
+# create a dataframe for each mouse that contain the exp-date and success rate
+success_rate_by_date <- mapply(function(name, dates, rates) {
+  data.frame(mouse_name = name, exp_date = dates, success_rate = rates)
+}, names(exp_dates), exp_dates, success_rates_per_mouse$success_rate, SIMPLIFY = FALSE)
+
+# combine all info in one
+success_rate_by_date <- do.call(rbind, success_rate_by_date)
+
+# create the plot for each mouse and how success over time
+ggplot(success_rate_by_date, aes(x = exp_date, y = success_rate, color = mouse_name)) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~mouse_name, scales = "free") +
+  theme_minimal() +
+  labs(title = "success rate over time by mouse name", x = "date", y = "success rate")
+
+
+```
+## Second assumption result and next step
+  Through the visualization of the drawing, I found that Lederberg is the mouse with the longest experimental days, and its overall Mean Spike Rate shows a downward trend. This may be due to fatigue. This is slightly different from its success rate in the Success Rate Over Time by Mouse graph. There may be a correlation with the decline. Although the correlation between Spike Rate and Success Rate Over Time is relatively weak, we cannot completely abandon the use of this variable, because among the remaining variables, these are the only ones we can use. We cannot only use Contrast is used to predict the model. Even if the ability of a variable is excellent, it is not the most appropriate. Therefore, after considering it, I plan to use contrast and time in the final model prediction, that is, the number of trials that change over time, because this may Including adaptability, inertia, and exhaustion, etc., which may occur in living things.
+
+# Data Integration
+  In this Part I will use the full_data11 data frame as the overall data frame. Our predictive_feature will be selected from it. The predictive_feature includes session_id, trial_id, contrast_right, contrast_left, contrast_diff and the spike rate of over timebin. And set the label to the success rate, The feedback type will be converted to set the success label.
+```{r}
+# set the predictive features and predcit label
+#binenames <- paste0("bin", 1:40)
+full_data11 <- full_data11 %>%
+  rename(
+    contrast_right = contrast_right.x,
+    contrast_left = contrast_left.x,
+    feedback_type = feedback_type.y
+  )
+#predictive_feature <- c("session_id","trial_id","contrast_right","contrast_left","contrast_diff", paste0("bin", 1:40))
+predictive_feature <- c("trial_id","contrast_right","contrast_left","contrast_diff",paste0("bin", 1:40))
+
+predictive_dat <- full_data11[, predictive_feature]
+label <- as.numeric(full_data11$feedback_type == 1)
+```
+
+# Prediction
+  I plan to divide the prediction part into three to test the prediction ability of my model. During the prediction process, we have predictive_feature and labels, which contain several variables. I decided to use xgboost to set up our predictive model because I set up a lot of predictive_features, which means there are some interactions among those interactions, and our training set is larger - the advantage is that it avoids overfitting combine. Because large amounts of data can often provide advantages for model training, while small amounts of data may lead to overfitting.
+  
+## First prediction part
+  I decided to divide the prediction step into three parts. In the first one, we will set 80% of the data as the training set and then use it to test the remaining 20% of the data set. Our data sets are trials. According to the results of the first part, I found that our data will gradually improve the fitted data in each round, and the prediction accuracy is around 84.87%. The Confusion Matrix points out the specific number of successful predictions and failed predictions of our model. Finally, The AUROC shows that it is at 0.9298, which is close to 1, which means that the performance of our model is good.
+
+```{r}
+set.seed(141) # for reproducibility
+trainIndex <- createDataPartition(label, p = 0.8, list = FALSE, times = 1)
+train_df <- predictive_dat[trainIndex, ]
+test_df <- predictive_dat[-trainIndex, ]
+
+train_label <- label[trainIndex]
+test_label <- label[-trainIndex]
+
+train_X <- as.matrix(train_df)
+test_X <- as.matrix(test_df)
+
+
+xgb_model1 <- xgboost(data = train_X, label = train_label, objective = "binary:logistic", nrounds=10)
+
+predictions <- predict(xgb_model1, newdata = test_X)
+predicted_labels <- as.numeric(ifelse(predictions > 0.5, 1, 0))
+accuracy <- mean(predicted_labels == test_label)
+print(paste("Accuracy:", accuracy))
+
+conf_matrix <- confusionMatrix(as.factor(predicted_labels), as.factor(test_label))
+print("Confusion Matrix:")
+print(conf_matrix$table)
+
+auroc <- roc(test_label, predictions)
+print(paste("AUROC:", auroc$auc))
+```
+## Second prediction part
+In the second part of model prediction, in order to better check the testing ability of my model in different sessions and mice, I decided to train a model using the training data except the 50 random trials of session 18. All data. Then I will test this model and set the test set as session trials. In this way, I can know that this model is used to evaluate the performance on the data of a specific session, and here I use session18. This result can also be reflected on other unique sessions. This is different from the first part. It uses other session data sets to predict the session data set, but it also contains some data. This may involve data between different mice, since each mouse is unlikely to be exactly the same. The accuracy of the second model is 80%, and the AUROC is 0.71, which is significantly lower than the first model, but still has very good performance, which means that when part of the data from the same session is excluded, it is possible to predict Performance is affected.
+```{r}
+# split the data
+set.seed(141)
+session_18_row <- which(full_data11$session_id == 18)
+testIndex <- sample(session_18_row, 50, replace = FALSE)
+# use the data didnt from the session 18 for the train set
+trainIndex <- which(full_data11$session_id != 18)
+
+train_df <- predictive_dat[trainIndex, ]
+#train_X <- model.matrix(~., train_df)
+test_df <- predictive_dat[testIndex, ]
+
+train_X <- as.matrix(train_df)
+test_X <- as.matrix(test_df)
+
+#test_X <- model.matrix(~., test_df)
+train_label <- label[trainIndex]
+test_label <- label[testIndex]
+
+# fit the model
+xgb_model2 <- xgboost(data = train_X, label = train_label, objective = "binary:logistic", nrounds=10, verbose=1)
+
+# predcite result
+predictions <- predict(xgb_model2, newdata = test_X)
+predicted_labels <- as.numeric(ifelse(predictions > 0.5, 1, 0))
+accuracy <- mean(predicted_labels == test_label)
+print(paste("Accuracy:", accuracy))
+
+conf_matrix <- confusionMatrix(as.factor(predicted_labels), as.factor(test_label))
+print("Confusion Matrix:")
+print(conf_matrix$table)
+
+auroc <- roc(test_label, predictions)
+print(paste("AUROC:", auroc$auc))
+```
+## Third prediction part
+  In order to better detect the effect of our model, I adjusted the training set. The training data here uses all data except the 50 random trials of session 1. We will then test this model on 50 random trials in session 1. Just like before, we can now evaluate the model's performance on session 1 data. This time the accuracy is 76%, and the AUROC has increased to 83.66%, which means there is still good prediction performance. But the accuracy rate is gradually declining, which may mean that the features we selected in different sessions do not have a deep impact on them, because the mice in session18 have the highest success rate, while the mice in session1 have the lowest success rate, so it may One of them can be explained better and the other is not easily explained. The more successful mice are accompanied by higher adaptability. They are also the mice that have experienced the longest number of experimental days. Cori in session 1 only experienced 3 days, while Lederberg has 7 days, which is consistent with the fact that our prediction model mainly uses data over time such as spike over time bin and trial id. Although the accuracy rates vary in different sessions, they all point to the correct selection of our assumptions and features, that is, the success rate of mice is indeed adaptable and time-related, so the data we use can be used in The mice with more data (more experimental days) had better predictability.
+```{r}
+# split the data
+set.seed(141)
+session_1_row <- which(full_data11$session_id == 1)
+testIndex <- sample(session_1_row, 50, replace = FALSE)
+trainIndex <- 1:nrow(full_data11)
+trainIndex <- trainIndex[!(trainIndex %in% testIndex)]
+
+
+
+train_df <- predictive_dat[trainIndex, ]
+#train_X <- model.matrix(~., train_df)
+test_df <- predictive_dat[testIndex, ]
+
+train_X <- as.matrix(train_df)
+test_X <- as.matrix(test_df)
+
+#test_X <- model.matrix(~., test_df)
+
+
+train_label <- label[trainIndex]
+test_label <- label[testIndex]
+
+# fit model agian
+xgb_model3 <- xgboost(data = train_X, label = train_label, objective = "binary:logistic", nrounds=10, verbose=1)
+
+# check the results
+predictions <- predict(xgb_model3, newdata = test_X)
+predicted_labels <- as.numeric(ifelse(predictions > 0.5, 1, 0))
+accuracy <- mean(predicted_labels == test_label)
+print(paste("Accuracy:", accuracy))
+
+conf_matrix <- confusionMatrix(as.factor(predicted_labels), as.factor(test_label))
+print("Confusion Matrix:")
+print(conf_matrix$table)
+
+auroc <- roc(test_label, predictions)
+print(paste("AUROC:", auroc$auc))
+```
+```{r}
+
+test1 <- readRDS("test/test1.rds")
+test2 <- readRDS("test/test2.rds")
+# before predict use the test1 and test2
+# i need to convert it to the df like the training data
+process_session_data <- function(session_data) {
+  # get session info
+  session_id <- session_data$session_id
+  mouse_name <- session_data$mouse_name
+  date_exp <- session_data$date_exp
+  
+  # trial number
+  trial_num <- length(session_data$spks)
+  
+  # extract trial info
+  trial_data <- map_dfr(1:trial_num, function(trial_id) {
+    spikes <- session_data$spks[[trial_id]]
+
+    
+    # spike over time bin
+    trial_bin_average <- matrix(colMeans(spikes), nrow = 1)
+    colnames(trial_bin_average) <- paste0("bin", 1:40)
+    
+    trial_tibble <- as_tibble(trial_bin_average) %>%
+      mutate(
+        trial_id = trial_id,
+        contrast_left = session_data$contrast_left[trial_id],
+        contrast_right = session_data$contrast_right[trial_id],
+        feedback_type = session_data$feedback_type[trial_id]
+      )
+    
+    return(trial_tibble)
+  })
+  
+  # combine info
+  trial_data$session_id <- session_id
+  trial_data$mouse_name <- mouse_name
+  trial_data$date_exp <- date_exp
+  trial_data$contrast_diff <- abs(trial_data$contrast_right - trial_data$contrast_left)
+  
+  return(trial_data)
+}
+
+# convert test1 df
+test1_df <- process_session_data(test1)
+
+# convert the test 2 df
+test2_df <- process_session_data(test2)
+
+predictive_feature <- c("trial_id","contrast_right","contrast_left","contrast_diff",paste0("bin", 1:40))
+
+test1_X <- as.matrix(test1_df[, predictive_feature])
+test2_X <- as.matrix(test2_df[, predictive_feature])
+
+test1_label <- as.numeric(test1_df$feedback_type == 1)
+test2_label <- as.numeric(test2_df$feedback_type == 1)
+
+# use previso model to predict
+predictions1 <- predict(xgb_model3, newdata = test1_X)
+predictions2 <- predict(xgb_model3, newdata = test2_X)
+
+# Accuracy , confusio matrix, and AUROC for test1
+predicted_labels1 <- as.numeric(ifelse(predictions1 > 0.5, 1, 0))
+accuracy1 <- mean(predicted_labels1 == test1_label)
+print(paste("Accuracy for test1:", accuracy1))
+
+conf_matrix1 <- confusionMatrix(as.factor(predicted_labels1), as.factor(test1_label))
+print("Confusion Matrix for test1:")
+print(conf_matrix1$table)
+
+auroc1 <- roc(test1_label, predictions1)
+print(paste("AUROC for test1:", auroc1$auc))
+
+# Accuracy , confusio matrix, and AUROC for test2
+predicted_labels2 <- as.numeric(ifelse(predictions2 > 0.5, 1, 0))
+accuracy2 <- mean(predicted_labels2 == test2_label)
+print(paste("Accuracy for test2:", accuracy2))
+
+conf_matrix2 <- confusionMatrix(as.factor(predicted_labels2), as.factor(test2_label))
+print("Confusion Matrix for test2:")
+print(conf_matrix2$table)
+
+auroc2 <- roc(test2_label, predictions2)
+print(paste("AUROC for test2:", auroc2$auc))
+
+```
+# Discussion
+## Prediction & Analysis 
+  In this project, I used a large data set containing 18 sessions, in which the neuronal activity and behavioral performance of four mice were recorded under different conditions. My main goal is to build a predictive model that predicts the success rate of mice under given conditions. To achieve this goal, I conducted a series of exploratory analysis, data integration, and predictive modeling.
+  During the exploratory analysis, I discovered some interesting patterns. First, I observed differences in the success rates of different mice, with Lederberg having the highest success rate of 76.39%. I also found that success rates in mice seemed to be related to differences in contrast, with mice generally having better success rates at higher contrasts. However, when I tried to correlate the success rate with brain activity (such as neuron number and spike rate), I found that the correlation was weak. This reminds me that when building a predictive model, I should focus on contrast differences and other variables that may affect the success rate. Then, I used methods such as PCA and clustering to further explore the structure of the data. The results of PCA show that most of the variation in the data can be explained by two principal components, the first of which is related to Lederberg's session. However, cluster analysis found no obvious segregating groups, which means that there may be large overlap and similarity between different mice and sessions. This finding reminded me that I need to be careful with this similarity when modeling to avoid overfitting.
+  Based on the above analysis, I selected contrast differences, time-related variables (such as trial number), spike rate and other variables during data integration, and then used these as predictive features to build a prediction model. I chose to use the xgboost algorithm because of its ability to handle a large number of features and automatically capture interactions between features. On the overall data set, my model achieved an accuracy of 84.87% and an AUROC of 0.9298, indicating that the performance of the model is quite good.
+  However, when I tested the model on specific sessions (such as session 18 and session 1), I found that the performance of the model decreased. This reminds us that the generalization ability of the model may be affected by the adaptability of the mouse and the length of the experiment. For example, on session 1, the model's accuracy dropped to 76%, possibly because the mice (such as Cori) had not fully adapted to the task in the early stages of the experiment. In contrast, on session 18, the model's accuracy remained at 80%, which may benefit from Lederberg's longer experimental time and better adaptability.
+  Although my model achieved good performance, there are still some limitations. First, although our data set contains 18 sessions, for some mice (such as Cori), there is relatively little data available. This may have limited the model's ability to capture the behavioral patterns of these mice. Secondly, my model mainly relies on contrast differences and time-related variables, but does not fully utilize the information of brain area activity. Although my preliminary analysis shows that the correlation between brain activity and success rate is weak, this may be due to the feature extraction method we used (such as average spike rate) that is not refined enough. Future research can explore more advanced feature extraction methods, such as time series analysis or functional data analysis, to better capture the dynamic patterns of brain area activity.
+## Final model selection
+  Class gave me two test data, named test1 and test2, from session1 and session18 respectively. After comparing three models (1. Randomly select 80% of the data as training and 20% as testing. 2. Except 50 of session 18 3.all data except the 50 random trials of session 1). I found that the accuracy and AUROC of test1 and test2 performed best in model3. The accuracy rates reached 72% and 74% respectively. At the same time, I removed the session id as a predictive feature because it is not temporal and is not included in the test data. This makes me believe that adaptability exists in predicting data. At the same time, cori's data does not provide much help. What provides more prediction help is the mice that experienced a longer experimental period later. (At the same time, it also supports the phenomenon that the accuracy rate of mice increases).
+  
+  Overall, my project shows how to explore and analyze data step by step from a large data framework and build a model to predict the success rate of mice in visual decision-making tasks. The analysis revealed the importance of contrast differences and time-related variables in predicting success, while also highlighting the influence of individual differences and adaptations in mice. These findings not only help understand the decision-making behavior of mice, but also provide a reference for designing more effective neuroscience experiments.
+  
+# Reference
+Discussion: Project Demo (2/27/2024)
+Discussion: Project Demo 2 (3/5/2024)
+by Jue Wang
+Steinmetz, N.A., Zatka-Haas, P., Carandini, M. et al. Distributed coding of choice, action and engagement across the mouse brain. Nature 576, 266–273 (2019). https://doi.org/10.1038/s41586-019-1787-x
+https://study.com/academy/lesson/natural-selection-and-adaptation.html
+Chatgpt (debug)
+https://juba.github.io/rmdformats/
+```{r}
+sessionInfo()
+```
