@@ -11,6 +11,8 @@ output:
     toc_float: true
     css: styles.css
 ---
+[View the project on GitHub](https://github.com/vintaminm/STA141a-final-project-zs/)
+
 # Abstract
   Understanding neural activity in response to stimuli is crucial for comprehending complex decision-making processes in animals. This study investigates the spike rate of mice while performing a visual discrimination task that presents two stimuli with contrast differences. Success in the task is determined by the mice's choice of the stimulus with higher contrast. Through meticulous data analysis and visualizations, a positive correlation between greater contrast differences and success rates was observed. Subsequently, a predictive model was developed using XGBoost, incorporating variables such as contrast differences and spike rate over time to accurately forecast task performance.
 
